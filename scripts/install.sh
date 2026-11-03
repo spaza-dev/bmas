@@ -114,7 +114,7 @@ fi
 . /etc/os-release
 
 if [[ "$ID" != "ubuntu" ]] ||
-   [[ "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ]]; then
+   [[ "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" && "$VERSION_ID" != "26.04"  ]]; then
     fail "Only Ubuntu 22.04 and 24.04 are supported."
 fi
 
