@@ -24,6 +24,7 @@ OLAF_REPO="https://github.com/JorenSix/Olaf.git"
 OLAF_REF="${OLAF_REF:-master}"
 
 ZIG_VERSION="${ZIG_VERSION:-0.14.1}"
+ZIG_INSTALL_DIR="/opt/zig-${ZIG_VERSION}"
 MIN_CARGO_VERSION="1.85.0"
 
 RUST_HOME="/root/.rustup"
@@ -50,6 +51,16 @@ fail() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+zig_is_usable() {
+    command_exists zig \
+        && [[ "$(zig version 2>/dev/null || true)" == "$ZIG_VERSION" ]] \
+        && zig env >/dev/null 2>&1
+}
+
+olaf_is_usable() {
+    command_exists olaf && olaf help >/dev/null 2>&1
 }
 
 version_ge() {
@@ -178,7 +189,7 @@ if command_exists zig; then
     CURRENT_ZIG_VERSION="$(zig version 2>/dev/null || true)"
 fi
 
-if [[ "$CURRENT_ZIG_VERSION" != "$ZIG_VERSION" ]]; then
+if ! zig_is_usable; then
 
     log "Installing Zig ${ZIG_VERSION} (current: ${CURRENT_ZIG_VERSION:-not installed})..."
 
@@ -194,9 +205,15 @@ if [[ "$CURRENT_ZIG_VERSION" != "$ZIG_VERSION" ]]; then
     [[ -x "$ZIG_EXTRACTED/zig" ]] \
         || fail "Zig binary was not found in downloaded archive."
 
-    install -m 0755 \
-        "$ZIG_EXTRACTED/zig" \
-        /usr/local/bin/zig
+    [[ -d "$ZIG_EXTRACTED/lib" ]] \
+        || fail "Zig lib directory was not found in downloaded archive."
+
+    rm -rf "$ZIG_INSTALL_DIR"
+    mkdir -p "$(dirname "$ZIG_INSTALL_DIR")"
+    mv "$ZIG_EXTRACTED" "$ZIG_INSTALL_DIR"
+
+    rm -f /usr/local/bin/zig
+    ln -s "$ZIG_INSTALL_DIR/zig" /usr/local/bin/zig
 
 else
     log "Required Zig version already installed."
@@ -207,7 +224,10 @@ ACTUAL_ZIG_VERSION="$(zig version)"
 [[ "$ACTUAL_ZIG_VERSION" == "$ZIG_VERSION" ]] \
     || fail "Expected Zig ${ZIG_VERSION}, found ${ACTUAL_ZIG_VERSION}."
 
-echo "Zig: $(zig version)"
+zig env >/dev/null 2>&1 \
+    || fail "Zig installation is incomplete (missing lib directory)."
+
+echo "Zig: $(zig version) ($(command -v zig))"
 
 # ============================================================
 # 3. OLAF
@@ -215,7 +235,7 @@ echo "Zig: $(zig version)"
 
 log "[3/8] Installing OLAF..."
 
-if command_exists olaf; then
+if olaf_is_usable; then
 
     echo "OLAF already installed. Skipping."
 
@@ -233,7 +253,7 @@ else
 
 fi
 
-command_exists olaf || fail "OLAF installation failed."
+olaf_is_usable || fail "OLAF installation failed."
 
 echo "OLAF: $(command -v olaf)"
 echo "FFmpeg: $(command -v ffmpeg)"
