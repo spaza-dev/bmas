@@ -1,0 +1,55 @@
+[node]
+id = "${BMAS_NODE_ID}"
+listen = "127.0.0.1:8787"
+data_dir = "/var/lib/bmas"
+api_token = "${BMAS_API_TOKEN}"
+max_concurrent_streams = 8
+reconnect_delay_seconds = 5
+keep_local_chunks = false
+allowed_origins = []
+
+[recording]
+ffmpeg_path = "/usr/bin/ffmpeg"
+ffprobe_path = "/usr/bin/ffprobe"
+olaf_path = "/usr/local/bin/olaf"
+
+chunk_seconds = 300
+sample_rate = 16000
+archive_audio = true
+ffprobe_timeout_seconds = 60
+olaf_timeout_seconds = 900
+stall_timeout_seconds = 600
+
+[indexing]
+threads = 2
+workers = 2
+max_retries = 5
+
+[r2]
+enabled = true
+account_id = "${BMAS_R2_ACCOUNT_ID}"
+access_key_id = "${BMAS_R2_ACCESS_KEY_ID}"
+secret_access_key = "${BMAS_R2_SECRET_ACCESS_KEY}"
+bucket = "${BMAS_R2_BUCKET}"
+region = "auto"
+prefix = "archives"
+endpoint_url = "${BMAS_R2_ENDPOINT_URL}"
+
+[heartbeat]
+enabled = false
+webhook_url = ""
+token = ""
+interval_seconds = 60
+
+[central]
+enabled = false
+base_url = "https://api.example.com"
+node_token = "${BMAS_CENTRAL_NODE_TOKEN}"
+heartbeat_interval_seconds = 60
+max_retries = 5
+
+[storage]
+min_free_gb = 2
+max_enabled_streams = 8
+work_retention_hours = 24
+local_retention_days = 0
