@@ -21,9 +21,9 @@ SERVICE_NAME="bmas.service"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 OLAF_REPO="https://github.com/JorenSix/Olaf.git"
-OLAF_REF="${OLAF_REF:-master}"
+OLAF_REF="${OLAF_REF:-v3.3.3}"
 
-ZIG_VERSION="${ZIG_VERSION:-0.14.1}"
+ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
 ZIG_INSTALL_DIR="/opt/zig-${ZIG_VERSION}"
 MIN_CARGO_VERSION="1.85.0"
 
