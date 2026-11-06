@@ -34,8 +34,9 @@ Update:
 
     sudo ./scripts/update.sh
 
-The updater preserves the installed configuration by default. Use
-`--sync-config` only when you intentionally want to replace it.
+The updater always uses the installed `/etc/bmas/config.toml`, applies
+any required configuration migrations, and preserves a backup at
+`/etc/bmas/config.toml.backup`.
 
 ## Configuration
 

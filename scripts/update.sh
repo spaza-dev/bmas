@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # Broadcast Monitoring & Archiving Service
 # Supported OS: Ubuntu 22.04 / 24.04
 #
-# Builds the current source, synchronizes configuration,
+# Builds the current source, migrates the installed configuration,
 # replaces the installed BMAS binary, and restarts the service.
 #
 # Automatically rolls back the binary and configuration
@@ -23,7 +23,6 @@ DATA_DIR="/var/lib/bmas"
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SOURCE_CONFIG="$SOURCE_DIR/config.toml"
 INSTALLED_CONFIG="$CONFIG_DIR/config.toml"
 
 SERVICE_FILE="/etc/systemd/system/bmas.service"
@@ -47,13 +46,10 @@ NEW_BINARY=""
 PREVIOUS_BINARY=""
 PREVIOUS_CONFIG=""
 
-CONFIG_UPDATED=false
 BINARY_UPDATED=false
-SYNC_CONFIG=false
 
 for arg in "$@"; do
     case "$arg" in
-        --sync-config) SYNC_CONFIG=true ;;
         *) echo "ERROR: Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -314,9 +310,6 @@ systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 \
 [[ -f "$INSTALLED_CONFIG" ]] \
     || fail "Installed configuration not found: $INSTALLED_CONFIG"
 
-[[ -f "$SOURCE_CONFIG" ]] \
-    || fail "Project configuration not found: $SOURCE_CONFIG"
-
 [[ -d "$SOURCE_DIR" ]] \
     || fail "Source directory not found: $SOURCE_DIR"
 
@@ -333,11 +326,6 @@ getent group bmas >/dev/null 2>&1 \
     || fail "The bmas group does not exist."
 
 TMP="$(mktemp -d)"
-
-log "Ensuring BMAS environment and systemd configuration..."
-migrate_legacy_config
-ensure_environment_file
-ensure_service_environment
 
 NEW_BINARY="$TMP/bmas.new"
 PREVIOUS_BINARY="$TMP/bmas.previous"
@@ -372,48 +360,22 @@ NEW_VERSION="$("$NEW_BINARY" --version 2>/dev/null || echo "version unavailable"
 echo "Installed: $OLD_VERSION"
 echo "Building:  $NEW_VERSION"
 
-# Temporary rollback copies.
+# Temporary and persistent rollback copies.
 cp -p "$CURRENT_BINARY" "$PREVIOUS_BINARY"
 cp -p "$INSTALLED_CONFIG" "$PREVIOUS_CONFIG"
+cp -p "$INSTALLED_CONFIG" "$BACKUP_CONFIG"
 
 # ------------------------------------------------------------
-# Synchronize configuration
+# Migrate installed configuration
 # ------------------------------------------------------------
 
-if [[ "$SYNC_CONFIG" == true ]]; then
+log "[3/5] Migrating installed BMAS configuration..."
 
-    log "[3/5] Synchronizing BMAS configuration..."
+migrate_legacy_config
+ensure_environment_file
+ensure_service_environment
 
-    # Preserve the currently installed configuration as a
-    # persistent backup before replacing it.
-    cp -p "$INSTALLED_CONFIG" "$BACKUP_CONFIG"
-
-    # Copy the project configuration into the production location.
-    # The bmas group must be able to read the configuration because
-    # the systemd service runs under the bmas account.
-    if ! install -o root -g bmas -m 0640 \
-        "$SOURCE_CONFIG" "$INSTALLED_CONFIG"; then
-
-        log "Configuration synchronization failed."
-
-        install -o root -g bmas -m 0640 \
-            "$PREVIOUS_CONFIG" "$INSTALLED_CONFIG"
-
-        fail "Update aborted. Previous configuration restored."
-    fi
-
-    CONFIG_UPDATED=true
-
-    log "Configuration synchronized successfully."
-    echo "Source:      $SOURCE_CONFIG"
-    echo "Destination: $INSTALLED_CONFIG"
-
-else
-
-    log "[3/5] Preserving installed BMAS configuration."
-    echo "Use --sync-config to replace $INSTALLED_CONFIG from the source tree."
-
-fi
+echo "Configuration: $INSTALLED_CONFIG"
 
 # ------------------------------------------------------------
 # Replace binary and restart service
@@ -475,10 +437,8 @@ if [[ "$START_SUCCESS" != true ]]; then
             "$PREVIOUS_BINARY" "$CURRENT_BINARY"
     fi
 
-    if [[ "$CONFIG_UPDATED" == true ]]; then
-        install -o root -g bmas -m 0640 \
-            "$PREVIOUS_CONFIG" "$INSTALLED_CONFIG"
-    fi
+    install -o root -g bmas -m 0640 \
+        "$PREVIOUS_CONFIG" "$INSTALLED_CONFIG"
 
     systemctl reset-failed "$SERVICE_NAME" || true
 
