@@ -8,13 +8,9 @@ pub struct Config {
     pub node: NodeConfig,
     pub recording: RecordingConfig,
     pub indexing: IndexingConfig,
-    pub r2: R2Config,
-    #[serde(default)]
-    pub heartbeat: HeartbeatConfig,
-    #[serde(default)]
-    pub central: CentralConfig,
-    #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 #[derive(Clone, Deserialize)]
@@ -26,6 +22,7 @@ pub struct NodeConfig {
     pub api_token: String,
     pub max_concurrent_streams: usize,
     pub reconnect_delay_seconds: u64,
+    #[serde(default)]
     pub keep_local_chunks: bool,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
@@ -58,52 +55,42 @@ pub struct IndexingConfig {
     pub max_retries: u32,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct R2Config {
-    pub enabled: bool,
-    pub account_id: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub bucket: String,
-    pub region: String,
-    pub prefix: String,
-    pub endpoint_url: String,
-}
-
-#[derive(Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct HeartbeatConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub webhook_url: String,
-    #[serde(default)]
-    pub token: String,
-    #[serde(default = "default_heartbeat_interval")]
-    pub interval_seconds: u64,
-}
-
-#[derive(Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CentralConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub base_url: String,
-    #[serde(default)]
-    pub node_token: String,
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval_seconds: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-}
-
+/// S3-compatible object storage used for archive payloads and manifests.
+///
+/// `backend = "r2"` derives the Cloudflare R2 endpoint from `account_id` when
+/// `endpoint_url` is empty. `backend = "s3"` supports AWS S3 and any
+/// S3-compatible service (MinIO, Backblaze B2, etc.).
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_storage_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub endpoint_url: String,
+    #[serde(default = "default_storage_region")]
+    pub region: String,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_storage_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub force_path_style: Option<bool>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
     #[serde(default = "default_min_free_gb")]
     pub min_free_gb: u64,
+    /// 0 means "same as node.max_concurrent_streams".
     #[serde(default)]
     pub max_enabled_streams: usize,
     #[serde(default = "default_work_retention")]
@@ -112,7 +99,7 @@ pub struct StorageConfig {
     pub local_retention_days: u64,
 }
 
-impl Default for StorageConfig {
+impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             min_free_gb: default_min_free_gb(),
@@ -138,14 +125,20 @@ fn default_workers() -> usize {
 fn default_max_retries() -> u32 {
     5
 }
-fn default_heartbeat_interval() -> u64 {
-    60
-}
 fn default_min_free_gb() -> u64 {
     2
 }
 fn default_work_retention() -> u64 {
     24
+}
+fn default_storage_backend() -> String {
+    "s3".to_string()
+}
+fn default_storage_region() -> String {
+    "auto".to_string()
+}
+fn default_storage_prefix() -> String {
+    "archives".to_string()
 }
 
 impl Config {
@@ -178,49 +171,30 @@ impl Config {
             "indexing.workers must be greater than zero"
         );
 
-        if config.r2.enabled {
-            anyhow::ensure!(!config.r2.bucket.is_empty(), "R2 bucket is required");
-            anyhow::ensure!(
-                !config.r2.account_id.is_empty(),
-                "R2 account ID is required"
-            );
-            anyhow::ensure!(
-                !config.r2.access_key_id.is_empty(),
-                "R2 access key is required"
-            );
-            anyhow::ensure!(
-                !config.r2.secret_access_key.is_empty(),
-                "R2 secret is required"
-            );
-        }
+        let backend = config.storage.backend.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            backend == "s3" || backend == "r2",
+            "storage.backend must be 's3' or 'r2'"
+        );
 
-        if config.heartbeat.enabled {
+        if config.storage.enabled {
             anyhow::ensure!(
-                config.heartbeat.webhook_url.starts_with("https://"),
-                "Heartbeat webhook must use HTTPS"
-            );
-        }
-
-        if config.central.enabled {
-            anyhow::ensure!(
-                config.central.base_url.starts_with("https://")
-                    || config.central.base_url.starts_with("http://127.0.0.1")
-                    || config.central.base_url.starts_with("http://localhost"),
-                "Central API base URL must use HTTPS"
+                !config.storage.bucket.trim().is_empty(),
+                "storage bucket is required when storage is enabled"
             );
             anyhow::ensure!(
-                config.central.node_token.len() >= 32,
-                "Central API node token must be at least 32 characters"
+                !config.storage.access_key_id.trim().is_empty(),
+                "storage access key is required when storage is enabled"
             );
             anyhow::ensure!(
-                uuid::Uuid::parse_str(&config.node.id).is_ok(),
-                "Node ID must be the UUID assigned by the central API"
+                !config.storage.secret_access_key.trim().is_empty(),
+                "storage secret is required when storage is enabled"
             );
 
-            if config.r2.enabled {
+            if backend == "r2" && config.storage.endpoint_url.trim().is_empty() {
                 anyhow::ensure!(
-                    config.r2.prefix.trim_matches('/') == "archives",
-                    "R2 prefix must be 'archives' when central integration is enabled"
+                    !config.storage.account_id.trim().is_empty(),
+                    "storage.account_id or storage.endpoint_url is required for R2"
                 );
             }
         }
@@ -229,10 +203,10 @@ impl Config {
     }
 
     pub fn max_enabled_streams(&self) -> usize {
-        if self.storage.max_enabled_streams == 0 {
+        if self.limits.max_enabled_streams == 0 {
             self.node.max_concurrent_streams
         } else {
-            self.storage.max_enabled_streams
+            self.limits.max_enabled_streams
         }
     }
 }

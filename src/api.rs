@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware,
     routing::{get, post},
@@ -12,15 +12,17 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
+    archive::ArchiveStore,
     auth,
     config::Config,
-    db::{Chunk, Database, NewStream, Stream, StreamUpdate},
+    db::{Database, NewStream, Stream, StreamUpdate},
     health,
 };
 
 pub struct AppState {
     pub config: Config,
     pub db: Database,
+    pub store: Option<Arc<ArchiveStore>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -108,14 +110,16 @@ pub struct ApiError {
     pub error: String,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ChunkQuery {
-    #[schema(example = "failed")]
-    pub status: Option<String>,
-    #[schema(example = 50, minimum = 1, maximum = 200)]
-    pub limit: Option<i64>,
-    #[schema(example = 0, minimum = 0)]
-    pub offset: Option<i64>,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub version: String,
+    pub status: String,
+    pub storage_enabled: bool,
+    pub storage_backend: String,
+    pub total_streams: i64,
+    pub enabled_streams: i64,
+    pub timestamp: String,
 }
 
 const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -126,10 +130,6 @@ where
     T: serde::Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
-}
-
-fn valid_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok()
 }
 
 fn map_create_error(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
@@ -361,22 +361,6 @@ async fn create_stream(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    if state.config.central.enabled {
-        let Some(external_id) = external_id else {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "external_id is required when central integration is enabled",
-            ));
-        };
-
-        if !valid_uuid(external_id) {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "external_id must be the central stream UUID",
-            ));
-        }
-    }
-
     if let Some(external_id) = external_id {
         if let Some(existing) = state
             .db
@@ -530,13 +514,6 @@ async fn update_stream(
             return Err(error(
                 StatusCode::BAD_REQUEST,
                 "external_id cannot be empty",
-            ));
-        }
-
-        if state.config.central.enabled && !valid_uuid(external_id) {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "external_id must be the central stream UUID",
             ));
         }
     }
@@ -711,8 +688,7 @@ async fn stop_stream(
         start_stream,
         stop_stream,
         monitoring_summary,
-        list_failed_chunks,
-        list_chunks,
+        node_status,
         health::live,
         health::ready,
     ),
@@ -721,9 +697,8 @@ async fn stop_stream(
         CreateStream,
         UpdateStream,
         MonitoringSummary,
+        NodeStatus,
         ApiError,
-        Chunk,
-        ChunkQuery,
     )),
     modifiers(&SecurityAddon)
 )]
@@ -758,8 +733,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/streams/{id}/start", post(start_stream))
         .route("/api/v1/streams/{id}/stop", post(stop_stream))
         .route("/api/v1/monitoring/summary", get(monitoring_summary))
-        .route("/api/v1/chunks/failed", get(list_failed_chunks))
-        .route("/api/v1/chunks", get(list_chunks))
+        .route("/api/v1/status", get(node_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_token,
@@ -814,57 +788,36 @@ async fn monitoring_summary(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/chunks/failed",
+    path = "/api/v1/status",
     responses(
-        (status = 200, description = "Failed chunks", body = [Chunk]),
+        (status = 200, description = "Node status", body = NodeStatus),
         (status = 401, description = "Unauthorized", body = ApiError)
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_failed_chunks(
+async fn node_status(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Chunk>>, (StatusCode, Json<ApiError>)> {
-    let chunks = state.db.failed_chunks().await.map_err(internal)?;
+) -> Result<Json<NodeStatus>, (StatusCode, Json<ApiError>)> {
+    let total_streams = state.db.total_stream_count().await.map_err(internal)?;
+    let enabled_streams = state.db.active_stream_count().await.map_err(internal)?;
 
-    Ok(Json(chunks))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/chunks",
-    params(
-        ("status" = Option<String>, Query, description = "Filter by chunk status"),
-        ("limit" = Option<i64>, Query, description = "Page size (1-200)"),
-        ("offset" = Option<i64>, Query, description = "Offset")
-    ),
-    responses(
-        (status = 200, description = "Chunks", body = [Chunk]),
-        (status = 401, description = "Unauthorized", body = ApiError)
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn list_chunks(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<ChunkQuery>,
-) -> Result<Json<Vec<Chunk>>, (StatusCode, Json<ApiError>)> {
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let offset = query.offset.unwrap_or(0).max(0);
-
-    let chunks = state
-        .db
-        .list_chunks(query.status.as_deref(), limit, offset)
-        .await
-        .map_err(internal)?;
-
-    Ok(Json(chunks))
+    Ok(Json(NodeStatus {
+        node_id: state.config.node.id.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        status: "healthy".to_string(),
+        storage_enabled: state.config.storage.enabled,
+        storage_backend: state.config.storage.backend.clone(),
+        total_streams,
+        enabled_streams,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        CentralConfig, HeartbeatConfig, IndexingConfig, NodeConfig, R2Config, RecordingConfig,
-        StorageConfig,
+        IndexingConfig, LimitsConfig, NodeConfig, RecordingConfig, StorageConfig,
     };
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
@@ -898,19 +851,19 @@ mod tests {
                 workers: 1,
                 max_retries: 1,
             },
-            r2: R2Config {
+            storage: StorageConfig {
                 enabled: false,
+                backend: "s3".to_string(),
+                endpoint_url: String::new(),
+                region: "auto".to_string(),
                 account_id: String::new(),
+                bucket: String::new(),
+                prefix: "bmas".to_string(),
                 access_key_id: String::new(),
                 secret_access_key: String::new(),
-                bucket: String::new(),
-                region: "auto".to_string(),
-                prefix: "bmas".to_string(),
-                endpoint_url: String::new(),
+                force_path_style: None,
             },
-            heartbeat: HeartbeatConfig::default(),
-            central: CentralConfig::default(),
-            storage: StorageConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 
@@ -919,7 +872,11 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let config = test_config(data_dir.to_string_lossy().to_string());
         let db = Database::open(&config.node.data_dir).await.unwrap();
-        Arc::new(AppState { config, db })
+        Arc::new(AppState {
+            config,
+            db,
+            store: None,
+        })
     }
 
     #[tokio::test]
@@ -942,7 +899,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/chunks/failed")
+                    .uri("/api/v1/status")
                     .body(Body::empty())
                     .unwrap(),
             )

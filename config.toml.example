@@ -25,30 +25,22 @@ threads = 2
 workers = 2
 max_retries = 5
 
-[r2]
-enabled = true
-account_id = "${BMAS_R2_ACCOUNT_ID}"
-access_key_id = "${BMAS_R2_ACCESS_KEY_ID}"
-secret_access_key = "${BMAS_R2_SECRET_ACCESS_KEY}"
-bucket = "${BMAS_R2_BUCKET}"
-region = "auto"
-prefix = "archives"
-endpoint_url = "${BMAS_R2_ENDPOINT_URL}"
-
-[heartbeat]
-enabled = false
-webhook_url = ""
-token = ""
-interval_seconds = 60
-
-[central]
-enabled = false
-base_url = "https://api.example.com"
-node_token = "${BMAS_CENTRAL_NODE_TOKEN}"
-heartbeat_interval_seconds = 60
-max_retries = 5
-
+# S3-compatible archive storage. backend = "r2" derives the Cloudflare
+# endpoint from account_id when endpoint_url is empty. Use backend = "s3"
+# for AWS S3, MinIO, Backblaze B2, etc.
 [storage]
+enabled = true
+backend = "r2"
+account_id = "${BMAS_STORAGE_ACCOUNT_ID}"
+endpoint_url = "${BMAS_STORAGE_ENDPOINT_URL}"
+region = "auto"
+bucket = "${BMAS_STORAGE_BUCKET}"
+prefix = "archives"
+access_key_id = "${BMAS_STORAGE_ACCESS_KEY_ID}"
+secret_access_key = "${BMAS_STORAGE_SECRET_ACCESS_KEY}"
+# force_path_style = true
+
+[limits]
 min_free_gb = 2
 max_enabled_streams = 8
 work_retention_hours = 24

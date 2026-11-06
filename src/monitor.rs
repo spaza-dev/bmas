@@ -1,12 +1,13 @@
 use crate::{
     api::AppState,
-    archive::{self, IndexObject, Manifest},
+    archive::{self, Manifest},
     indexer,
     recorder::{Capture, CompletedSegment},
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashSet,
@@ -16,13 +17,29 @@ use std::{
 };
 use tokio::{
     process::Command,
-    sync::{Mutex, Semaphore},
+    sync::{mpsc, Mutex, Semaphore},
     task::JoinSet,
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchiveJob {
+    chunk_id: String,
+    stream_id: String,
+    stream_name: String,
+    external_stream_id: Option<String>,
+    archive_audio: bool,
+    metadata: serde_json::Value,
+    started_at: String,
+    ended_at: String,
+    segment_path: String,
+    work_root: String,
+    #[serde(default)]
+    retry_count: u32,
+}
 
 fn sanitize_stream_name(name: &str) -> String {
     let sanitized = name
@@ -61,7 +78,7 @@ fn archive_key(prefix: &str, node_id: &str, stream_id: &str, day: &str, chunk_id
     let prefix = prefix.trim_matches('/');
 
     if prefix.is_empty() {
-        format!("archives/{}/{}/{}/{}", node_id, stream_id, day, chunk_id)
+        format!("{}/{}/{}/{}", node_id, stream_id, day, chunk_id)
     } else {
         format!("{}/{}/{}/{}/{}", prefix, node_id, stream_id, day, chunk_id)
     }
@@ -83,35 +100,38 @@ fn stream_chunk_seconds(stream: &crate::db::Stream, default: u64) -> u64 {
 }
 
 pub async fn run(state: Arc<AppState>, shutdown: CancellationToken) {
-    if let Err(error) = state.db.recover_interrupted_chunks().await {
-        error!(error = %error, "Could not recover interrupted chunks");
-    }
-
     cleanup_old_directories(
         PathBuf::from(&state.config.node.data_dir).join("work"),
-        state.config.storage.work_retention_hours,
+        state.config.limits.work_retention_hours,
     )
     .await;
 
-    if state.config.storage.local_retention_days > 0 {
+    if state.config.limits.local_retention_days > 0 {
         cleanup_old_directories(
             PathBuf::from(&state.config.node.data_dir).join("archives"),
-            state.config.storage.local_retention_days * 24,
+            state.config.limits.local_retention_days * 24,
         )
         .await;
     }
 
-    let stream_slots = Arc::new(Semaphore::new(state.config.node.max_concurrent_streams));
-    let active = Arc::new(Mutex::new(HashSet::new()));
+    let (job_tx, job_rx) = mpsc::channel::<ArchiveJob>(100);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+
     let mut tasks = JoinSet::new();
 
     for worker in 0..state.config.indexing.workers {
         let state = state.clone();
         let shutdown = shutdown.clone();
+        let job_rx = job_rx.clone();
         tasks.spawn(async move {
-            worker_loop(state, shutdown, format!("worker-{}", worker)).await;
+            archive_worker(state, job_rx, shutdown, format!("worker-{}", worker)).await;
         });
     }
+
+    recover_pending_jobs(&state, &job_tx).await;
+
+    let stream_slots = Arc::new(Semaphore::new(state.config.node.max_concurrent_streams));
+    let active = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
         if shutdown.is_cancelled() {
@@ -134,6 +154,7 @@ pub async fn run(state: Arc<AppState>, shutdown: CancellationToken) {
                     let slots = stream_slots.clone();
                     let shutdown = shutdown.clone();
                     let active = active.clone();
+                    let job_tx = job_tx.clone();
                     let stream_id = stream.id.clone();
 
                     tasks.spawn(async move {
@@ -150,7 +171,7 @@ pub async fn run(state: Arc<AppState>, shutdown: CancellationToken) {
                             return;
                         }
 
-                        if let Err(error) = run_stream(state, stream, shutdown).await {
+                        if let Err(error) = run_stream(state, stream, shutdown, job_tx).await {
                             error!(
                                 stream_id = %stream_id,
                                 error = %error,
@@ -174,7 +195,10 @@ pub async fn run(state: Arc<AppState>, shutdown: CancellationToken) {
         }
     }
 
-    let _ = timeout(Duration::from_secs(15), async {
+    // Stop producers first, then let workers drain what they can.
+    drop(job_tx);
+
+    let _ = timeout(Duration::from_secs(30), async {
         while tasks.join_next().await.is_some() {}
     })
     .await;
@@ -184,6 +208,7 @@ async fn run_stream(
     state: Arc<AppState>,
     mut stream: crate::db::Stream,
     shutdown: CancellationToken,
+    job_tx: mpsc::Sender<ArchiveJob>,
 ) -> Result<()> {
     let stream_id = stream.id.clone();
 
@@ -217,13 +242,13 @@ async fn run_stream(
 
         if !has_free_space(
             &state.config.node.data_dir,
-            state.config.storage.min_free_gb,
+            state.config.limits.min_free_gb,
         )
         .await
         {
             warn!(
                 stream_id = %stream_id,
-                min_free_gb = state.config.storage.min_free_gb,
+                min_free_gb = state.config.limits.min_free_gb,
                 "Insufficient disk space; pausing capture"
             );
             tokio::select! {
@@ -236,6 +261,7 @@ async fn run_stream(
         let run_id = Uuid::new_v4().to_string();
         let capture_dir = PathBuf::from(&state.config.node.data_dir)
             .join("work")
+            .join("capture")
             .join(&stream_id)
             .join(&run_id);
 
@@ -256,6 +282,7 @@ async fn run_stream(
             Ok(capture) => capture,
             Err(error) => {
                 warn!(stream_id = %stream_id, error = %error, "FFmpeg startup failed");
+                let _ = tokio::fs::remove_dir_all(&capture_dir).await;
                 tokio::select! {
                     _ = sleep(Duration::from_secs(state.config.node.reconnect_delay_seconds)) => {}
                     _ = shutdown.cancelled() => break,
@@ -287,7 +314,7 @@ async fn run_stream(
             let completed = capture.completed_chunks().await?;
 
             for segment in completed {
-                if let Err(error) = enqueue_segment(&state, &stream, segment).await {
+                if let Err(error) = enqueue_segment(&state, &stream, segment, &job_tx).await {
                     error!(
                         stream_id = %stream_id,
                         error = %error,
@@ -351,7 +378,7 @@ async fn run_stream(
 
         if let Ok(remaining) = capture.completed_chunks().await {
             for segment in remaining {
-                if let Err(error) = enqueue_segment(&state, &stream, segment).await {
+                if let Err(error) = enqueue_segment(&state, &stream, segment, &job_tx).await {
                     error!(
                         stream_id = %stream_id,
                         error = %error,
@@ -362,7 +389,7 @@ async fn run_stream(
         }
 
         let _ = tokio::fs::remove_file(&capture.list_path).await;
-        let _ = tokio::fs::remove_dir(&capture_dir).await;
+        let _ = tokio::fs::remove_dir_all(&capture_dir).await;
 
         if disabled || shutdown.is_cancelled() {
             break;
@@ -381,142 +408,215 @@ async fn enqueue_segment(
     state: &Arc<AppState>,
     stream: &crate::db::Stream,
     segment: CompletedSegment,
+    job_tx: &mpsc::Sender<ArchiveJob>,
 ) -> Result<()> {
     let chunk_id = Uuid::new_v4().to_string();
-    let day = segment.started_at.format("%Y-%m-%d").to_string();
     let work_root = PathBuf::from(&state.config.node.data_dir)
-        .join("archives")
-        .join(&stream.id)
-        .join(&day)
+        .join("work")
+        .join("pending")
         .join(&chunk_id);
 
     tokio::fs::create_dir_all(&work_root)
         .await
-        .with_context(|| format!("Creating archive directory {}", work_root.display()))?;
+        .with_context(|| format!("Creating work directory {}", work_root.display()))?;
 
-    state
-        .db
-        .create_chunk(
-            &chunk_id,
-            &stream.id,
-            &segment.started_at.to_rfc3339(),
-            &work_root.to_string_lossy(),
-            &segment.path.to_string_lossy(),
-        )
-        .await?;
+    let segment_path = work_root.join("segment.wav");
 
-    let _ = segment.ended_at;
+    if let Err(rename_error) = tokio::fs::rename(&segment.path, &segment_path).await {
+        tokio::fs::copy(&segment.path, &segment_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Moving segment {} into work directory (rename failed: {})",
+                    segment.path.display(),
+                    rename_error
+                )
+            })?;
+        let _ = tokio::fs::remove_file(&segment.path).await;
+    }
+
+    let metadata = serde_json::from_str::<serde_json::Value>(&stream.metadata)
+        .unwrap_or_else(|_| json!({}));
+
+    let archive_audio = stream
+        .archive_audio
+        .map(|value| value == 1)
+        .unwrap_or(state.config.recording.archive_audio);
+
+    let job = ArchiveJob {
+        chunk_id,
+        stream_id: stream.id.clone(),
+        stream_name: stream.name.clone(),
+        external_stream_id: stream.external_id.clone(),
+        archive_audio,
+        metadata,
+        started_at: segment.started_at.to_rfc3339(),
+        ended_at: segment.ended_at.to_rfc3339(),
+        segment_path: segment_path.to_string_lossy().to_string(),
+        work_root: work_root.to_string_lossy().to_string(),
+        retry_count: 0,
+    };
+
+    write_job(&work_root, &job).await?;
+
+    job_tx
+        .send(job)
+        .await
+        .context("Archive queue is closed; segment retained on disk for recovery")
+}
+
+async fn write_job(work_root: &Path, job: &ArchiveJob) -> Result<()> {
+    let path = work_root.join("job.json");
+    let content = serde_json::to_vec_pretty(job).context("Serializing archive job")?;
+    tokio::fs::write(&path, content)
+        .await
+        .with_context(|| format!("Writing job file {}", path.display()))?;
     Ok(())
 }
 
-async fn worker_loop(state: Arc<AppState>, shutdown: CancellationToken, worker_id: String) {
+async fn recover_pending_jobs(state: &Arc<AppState>, job_tx: &mpsc::Sender<ArchiveJob>) {
+    let root = PathBuf::from(&state.config.node.data_dir)
+        .join("work")
+        .join("pending");
+
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return;
+    };
+
+    let mut recovered = 0usize;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let work_root = entry.path();
+
+        if !work_root.is_dir() {
+            continue;
+        }
+
+        let job_path = work_root.join("job.json");
+        let Ok(content) = tokio::fs::read(&job_path).await else {
+            let _ = tokio::fs::remove_dir_all(&work_root).await;
+            continue;
+        };
+
+        let Ok(job) = serde_json::from_slice::<ArchiveJob>(&content) else {
+            warn!(path = %job_path.display(), "Ignoring unreadable archive job");
+            continue;
+        };
+
+        if !tokio::fs::try_exists(&job.segment_path).await.unwrap_or(false) {
+            warn!(
+                chunk_id = %job.chunk_id,
+                "Dropping archive job whose segment is missing"
+            );
+            let _ = tokio::fs::remove_dir_all(&work_root).await;
+            continue;
+        }
+
+        if job_tx.send(job).await.is_ok() {
+            recovered += 1;
+        }
+    }
+
+    if recovered > 0 {
+        info!(recovered, "Recovered in-flight archive jobs");
+    }
+}
+
+async fn archive_worker(
+    state: Arc<AppState>,
+    job_rx: Arc<Mutex<mpsc::Receiver<ArchiveJob>>>,
+    shutdown: CancellationToken,
+    worker_id: String,
+) {
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        match state.db.claim_chunk(&worker_id, 3600).await {
-            Ok(Some(chunk)) => {
-                if let Err(error) = process_chunk(&state, &chunk).await {
-                    let message = truncate_error(&format!("{:#}", error));
+        let job = {
+            let mut receiver = job_rx.lock().await;
+            tokio::select! {
+                job = receiver.recv() => job,
+                _ = shutdown.cancelled() => None,
+            }
+        };
 
-                    if chunk.retry_count + 1 >= state.config.indexing.max_retries as i64 {
+        let Some(mut job) = job else {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            // Channel closed by the producer.
+            break;
+        };
+
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            match process_job(&state, &job).await {
+                Ok(()) => break,
+                Err(error) => {
+                    let message = truncate_error(&format!("{:#}", error));
+                    job.retry_count += 1;
+
+                    if job.retry_count >= state.config.indexing.max_retries {
                         error!(
-                            chunk_id = %chunk.id,
+                            worker_id = %worker_id,
+                            chunk_id = %job.chunk_id,
                             error = %message,
-                            "Chunk processing failed permanently"
+                            "Archive job failed permanently"
                         );
-                        if let Err(update_error) =
-                            state.db.mark_chunk_failed(&chunk.id, &message).await
-                        {
-                            error!(chunk_id = %chunk.id, error = %update_error, "Could not mark chunk failed");
-                        }
-                    } else {
-                        let delay = backoff_seconds(chunk.retry_count);
-                        let next_retry = Utc::now() + ChronoDuration::seconds(delay as i64);
-                        warn!(
-                            chunk_id = %chunk.id,
-                            error = %message,
-                            retry_in_seconds = delay,
-                            "Chunk processing failed; scheduling retry"
-                        );
-                        if let Err(update_error) = state
-                            .db
-                            .schedule_chunk_retry(&chunk.id, &message, &next_retry.to_rfc3339())
-                            .await
-                        {
-                            error!(chunk_id = %chunk.id, error = %update_error, "Could not schedule chunk retry");
-                        }
+                        cleanup_failed_job(&state, &job).await;
+                        break;
                     }
-                }
-            }
-            Ok(None) => {
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(1)) => {}
-                    _ = shutdown.cancelled() => break,
-                }
-            }
-            Err(error) => {
-                error!(worker_id = %worker_id, error = %error, "Could not claim chunk");
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(5)) => {}
-                    _ = shutdown.cancelled() => break,
+
+                    let delay = backoff_seconds(job.retry_count);
+                    warn!(
+                        worker_id = %worker_id,
+                        chunk_id = %job.chunk_id,
+                        error = %message,
+                        retry_in_seconds = delay,
+                        "Archive job failed; retrying"
+                    );
+                    let _ = write_job(Path::new(&job.work_root), &job).await;
+
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(delay)) => {}
+                        _ = shutdown.cancelled() => break,
+                    }
                 }
             }
         }
     }
 }
 
-async fn process_chunk(state: &Arc<AppState>, chunk: &crate::db::Chunk) -> Result<()> {
-    let stream = state.db.get_stream(&chunk.stream_id).await?;
+async fn cleanup_failed_job(state: &AppState, job: &ArchiveJob) {
+    if state.config.node.keep_local_chunks {
+        return;
+    }
 
-    let stream_name = stream
-        .as_ref()
-        .map(|stream| stream.name.clone())
-        .unwrap_or_else(|| "unknown-stream".to_string());
-    let external_id = stream
-        .as_ref()
-        .and_then(|stream| stream.external_id.clone());
-    let archive_audio = stream
-        .as_ref()
-        .and_then(|stream| stream.archive_audio.map(|value| value == 1))
-        .unwrap_or(state.config.recording.archive_audio);
-    let metadata = stream
-        .as_ref()
-        .and_then(|stream| serde_json::from_str::<serde_json::Value>(&stream.metadata).ok())
-        .unwrap_or_else(|| json!({}));
+    let _ = tokio::fs::remove_dir_all(&job.work_root).await;
+}
 
-    let segment_path = chunk
-        .segment_path
-        .as_deref()
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("Chunk has no segment path"))?;
+async fn process_job(state: &Arc<AppState>, job: &ArchiveJob) -> Result<()> {
+    let segment_path = PathBuf::from(&job.segment_path);
+    let work_root = PathBuf::from(&job.work_root);
 
-    let started_at = DateTime::parse_from_rfc3339(&chunk.started_at)
+    anyhow::ensure!(
+        tokio::fs::try_exists(&segment_path).await.unwrap_or(false),
+        "Segment is missing: {}",
+        segment_path.display()
+    );
+
+    let started_at = DateTime::parse_from_rfc3339(&job.started_at)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
     let day = started_at.format("%Y-%m-%d").to_string();
 
-    let work_root = chunk
-        .local_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(&state.config.node.data_dir)
-                .join("archives")
-                .join(&chunk.stream_id)
-                .join(&day)
-                .join(&chunk.id)
-        });
-
     tokio::fs::create_dir_all(&work_root).await?;
 
-    let identifier = format!("{}/{}/{}", chunk.stream_id, day, chunk.id);
-
-    state
-        .db
-        .update_chunk_status(&chunk.id, "indexing", None)
-        .await?;
+    let identifier = format!("{}/{}/{}", job.stream_id, day, job.chunk_id);
 
     let index_path = indexer::index_chunk(
         &state.config.recording.olaf_path,
@@ -530,9 +630,9 @@ async fn process_chunk(state: &Arc<AppState>, chunk: &crate::db::Chunk) -> Resul
 
     let _ = tokio::fs::remove_dir_all(work_root.join("olaf-home")).await;
 
-    let audio_name = archive_name(&stream_name, started_at);
+    let audio_name = archive_name(&job.stream_name, started_at);
     let audio_filename = format!("{}.wav", audio_name);
-    let stored_audio = if archive_audio {
+    let stored_audio = if job.archive_audio {
         tokio::fs::copy(&segment_path, work_root.join(&audio_filename))
             .await
             .with_context(|| format!("Archiving audio {}", segment_path.display()))?;
@@ -547,37 +647,24 @@ async fn process_chunk(state: &Arc<AppState>, chunk: &crate::db::Chunk) -> Resul
         state.config.recording.ffprobe_timeout_seconds,
     )
     .await?;
-    let ended_at = started_at + ChronoDuration::seconds(duration);
 
     let key = archive_key(
-        &state.config.r2.prefix,
+        &state.config.storage.prefix,
         &state.config.node.id,
-        &chunk.stream_id,
+        &job.stream_id,
         &day,
-        &chunk.id,
+        &job.chunk_id,
     );
 
-    if state.config.central.enabled {
-        anyhow::ensure!(
-            key.starts_with(&format!("archives/{}/", state.config.node.id)),
-            "Archive key '{}' is outside archives/{}",
-            key,
-            state.config.node.id
-        );
-    }
-
-    let index_objects = vec![IndexObject {
-        object_key: format!("{}/index", key),
-        format: "olaf-lmdb".to_string(),
-        version: "1".to_string(),
-    }];
+    let index_objects = archive::index_object_keys(&index_path, &key).await?;
     let audio_object = stored_audio.then(|| format!("{}/{}", key, audio_filename));
 
     let manifest = Manifest {
+        manifest_version: archive::MANIFEST_VERSION.to_string(),
         node_id: state.config.node.id.clone(),
-        stream_id: chunk.stream_id.clone(),
-        external_stream_id: external_id.clone(),
-        chunk_id: chunk.id.clone(),
+        stream_id: job.stream_id.clone(),
+        external_stream_id: job.external_stream_id.clone(),
+        chunk_id: job.chunk_id.clone(),
         started_at: started_at.to_rfc3339(),
         completed_at: Utc::now().to_rfc3339(),
         duration_seconds: duration,
@@ -585,125 +672,46 @@ async fn process_chunk(state: &Arc<AppState>, chunk: &crate::db::Chunk) -> Resul
         index_format: "olaf-lmdb".to_string(),
         olaf_identifier: identifier,
         status: "complete".to_string(),
-        index_objects: index_objects.clone(),
-        audio_object: audio_object.clone(),
-        metadata: metadata.clone(),
+        index_objects,
+        audio_object,
+        metadata: job.metadata.clone(),
     };
 
     archive::write_manifest(&work_root, &manifest).await?;
 
-    let mut index_uploaded = false;
-    let mut audio_uploaded = false;
+    if let Some(store) = state.store.as_ref() {
+        let uploaded_keys = store.upload_directory(&work_root, &key).await?;
+        info!(
+            chunk_id = %job.chunk_id,
+            uploaded_files = uploaded_keys.len(),
+            "Archive payload uploaded"
+        );
 
-    if state.config.r2.enabled {
-        state
-            .db
-            .update_chunk_status(&chunk.id, "uploading", None)
-            .await?;
-
-        let uploaded_keys = archive::upload_directory(&state.config.r2, &work_root, &key).await?;
-        index_uploaded = uploaded_keys
-            .iter()
-            .any(|uploaded| uploaded.contains("/index/"));
-        audio_uploaded = stored_audio
-            && uploaded_keys
-                .iter()
-                .any(|uploaded| uploaded.ends_with(&audio_filename));
-    }
-
-    if state.config.central.enabled {
-        let metadata_size = serde_json::to_vec(&metadata)
-            .map(|value| value.len())
-            .unwrap_or(usize::MAX);
-
-        if !state.config.r2.enabled {
-            warn!(
-                chunk_id = %chunk.id,
-                "Skipping central archive callback because R2 is disabled"
-            );
-        } else if external_id.is_none() {
-            warn!(
-                chunk_id = %chunk.id,
-                stream_id = %chunk.stream_id,
-                "Skipping central archive callback because the stream has no external_id"
-            );
-        } else if Uuid::parse_str(external_id.as_deref().unwrap_or("")).is_err() {
-            warn!(
-                chunk_id = %chunk.id,
-                stream_id = %chunk.stream_id,
-                external_id = %external_id.as_deref().unwrap_or(""),
-                "Skipping central archive callback because external_id is not a UUID"
-            );
-        } else if metadata_size > 64 * 1024 {
-            warn!(
-                chunk_id = %chunk.id,
-                stream_id = %chunk.stream_id,
-                metadata_size,
-                "Skipping central archive callback because metadata exceeds 64 KiB"
-            );
-        } else {
-            let external_stream_id = external_id.as_deref().unwrap_or("");
-            let payload = json!({
-                "node_chunk_id": chunk.id,
-                "external_stream_id": external_stream_id,
-                "started_at": started_at.to_rfc3339(),
-                "ended_at": ended_at.to_rfc3339(),
-                "duration_seconds": duration,
-                "status": "complete",
-                "index_archived": index_uploaded,
-                "audio_archived": audio_uploaded,
-                "r2_prefix": key,
-                "manifest": {
-                    "index_objects": index_objects,
-                    "audio_object": audio_object
-                },
-                "metadata": metadata
-            });
-
-            state
-                .db
-                .enqueue_callback("archive", &payload.to_string())
-                .await?;
-        }
-    }
-
-    let status = if state.config.r2.enabled {
-        "complete"
+        let manifest_key = store.upload_manifest(&manifest).await?;
+        info!(
+            chunk_id = %job.chunk_id,
+            manifest_key = %manifest_key,
+            "Archive manifest published"
+        );
     } else {
-        "complete_local"
-    };
-
-    state
-        .db
-        .complete_chunk(
-            &chunk.id,
-            crate::db::ChunkCompletion {
-                ended_at: &ended_at.to_rfc3339(),
-                duration,
-                r2_prefix: state.config.r2.enabled.then_some(key.as_str()),
-                status,
-                index_archived: index_path.exists(),
-                audio_archived: stored_audio,
-                index_uploaded,
-                audio_uploaded,
-            },
-        )
-        .await?;
+        info!(
+            chunk_id = %job.chunk_id,
+            "Storage disabled; archive retained locally"
+        );
+    }
 
     let _ = tokio::fs::remove_file(&segment_path).await;
-    if let Some(parent) = segment_path.parent() {
-        let _ = tokio::fs::remove_dir(parent).await;
-    }
 
-    if state.config.r2.enabled && !state.config.node.keep_local_chunks {
+    if !state.config.node.keep_local_chunks && state.store.is_some() {
         let _ = tokio::fs::remove_dir_all(&work_root).await;
     }
 
     info!(
-        stream_id = %chunk.stream_id,
-        chunk_id = %chunk.id,
-        r2_key = %key,
+        stream_id = %job.stream_id,
+        chunk_id = %job.chunk_id,
+        key = %key,
         duration_seconds = duration,
+        ended_at = %job.ended_at,
         "Chunk archived successfully"
     );
 
@@ -750,8 +758,8 @@ async fn probe_duration(ffprobe: &str, audio_path: &Path, timeout_seconds: u64) 
     Ok(duration.round() as i64)
 }
 
-fn backoff_seconds(retry_count: i64) -> u64 {
-    let exponent = retry_count.clamp(0, 10) as u32;
+fn backoff_seconds(retry_count: u32) -> u64 {
+    let exponent = retry_count.min(10);
     let base = 5u64.saturating_mul(2u64.saturating_pow(exponent)).min(3600);
     let jitter = rand::thread_rng().gen_range(0..=base / 2);
     base + jitter
@@ -883,5 +891,26 @@ mod tests {
             assert!(delay >= 5);
             assert!(delay <= 5400);
         }
+    }
+
+    #[test]
+    fn archive_job_round_trips_through_json() {
+        let job = ArchiveJob {
+            chunk_id: "chunk-1".to_string(),
+            stream_id: "stream-1".to_string(),
+            stream_name: "Example FM".to_string(),
+            external_stream_id: None,
+            archive_audio: true,
+            metadata: json!({"city": "Nairobi"}),
+            started_at: "2026-11-03T09:00:00+00:00".to_string(),
+            ended_at: "2026-11-03T09:05:00+00:00".to_string(),
+            segment_path: "/tmp/segment.wav".to_string(),
+            work_root: "/tmp/work".to_string(),
+            retry_count: 0,
+        };
+
+        let encoded = serde_json::to_string(&job).unwrap();
+        let decoded: ArchiveJob = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.chunk_id, job.chunk_id);
     }
 }

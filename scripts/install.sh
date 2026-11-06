@@ -365,8 +365,8 @@ if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
         "$SOURCE_DIR/config.toml.example" \
         "$CONFIG_DIR/config.toml"
 
-    # R2 remains disabled until the operator provisions credentials.
-    sed -i '/^\[r2\]/,/^\[/ s/^enabled = true/enabled = false/' \
+    # Object storage remains disabled until the operator provisions credentials.
+    sed -i '/^\[storage\]/,/^\[/ s/^enabled = true/enabled = false/' \
         "$CONFIG_DIR/config.toml"
 
     TOKEN="$(openssl rand -hex 32)"
@@ -375,12 +375,11 @@ if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     cat > "$CONFIG_DIR/bmas.env" <<EOF
 BMAS_API_TOKEN=${TOKEN}
 BMAS_NODE_ID=${NODE_ID}
-BMAS_R2_ACCOUNT_ID=
-BMAS_R2_ACCESS_KEY_ID=
-BMAS_R2_SECRET_ACCESS_KEY=
-BMAS_R2_BUCKET=
-BMAS_R2_ENDPOINT_URL=
-BMAS_CENTRAL_NODE_TOKEN=
+BMAS_STORAGE_ACCOUNT_ID=
+BMAS_STORAGE_ACCESS_KEY_ID=
+BMAS_STORAGE_SECRET_ACCESS_KEY=
+BMAS_STORAGE_BUCKET=
+BMAS_STORAGE_ENDPOINT_URL=
 EOF
 
     chown root:root "$CONFIG_DIR/bmas.env"
@@ -389,7 +388,7 @@ EOF
     echo "Generated secure API token in $CONFIG_DIR/bmas.env."
     echo "Generated node UUID $NODE_ID in $CONFIG_DIR/bmas.env."
     echo "When provisioning this node in the central API, replace BMAS_NODE_ID with the UUID returned by central."
-    echo "Provision R2 credentials in $CONFIG_DIR/bmas.env before enabling [r2]."
+    echo "Provision storage credentials in $CONFIG_DIR/bmas.env before enabling [storage]."
 
 else
 

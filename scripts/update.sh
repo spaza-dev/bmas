@@ -121,12 +121,11 @@ seed_environment_from_config() {
     for mapping in \
         "BMAS_NODE_ID:node:id" \
         "BMAS_API_TOKEN:node:api_token" \
-        "BMAS_R2_ACCOUNT_ID:r2:account_id" \
-        "BMAS_R2_ACCESS_KEY_ID:r2:access_key_id" \
-        "BMAS_R2_SECRET_ACCESS_KEY:r2:secret_access_key" \
-        "BMAS_R2_BUCKET:r2:bucket" \
-        "BMAS_R2_ENDPOINT_URL:r2:endpoint_url" \
-        "BMAS_CENTRAL_NODE_TOKEN:central:node_token"; do
+        "BMAS_STORAGE_ACCOUNT_ID:storage:account_id" \
+        "BMAS_STORAGE_ACCESS_KEY_ID:storage:access_key_id" \
+        "BMAS_STORAGE_SECRET_ACCESS_KEY:storage:secret_access_key" \
+        "BMAS_STORAGE_BUCKET:storage:bucket" \
+        "BMAS_STORAGE_ENDPOINT_URL:storage:endpoint_url"; do
 
         env_name="${mapping%%:*}"
         mapping="${mapping#*:}"
@@ -161,15 +160,18 @@ ensure_environment_file() {
     grep -q '^BMAS_NODE_ID=' "$ENV_FILE" \
         || echo "BMAS_NODE_ID=$node_id" >> "$ENV_FILE"
 
-    local key
+    local key legacy legacy_value
     for key in \
-        BMAS_R2_ACCOUNT_ID \
-        BMAS_R2_ACCESS_KEY_ID \
-        BMAS_R2_SECRET_ACCESS_KEY \
-        BMAS_R2_BUCKET \
-        BMAS_R2_ENDPOINT_URL \
-        BMAS_CENTRAL_NODE_TOKEN; do
-        grep -q "^${key}=" "$ENV_FILE" || echo "${key}=" >> "$ENV_FILE"
+        BMAS_STORAGE_ACCOUNT_ID \
+        BMAS_STORAGE_ACCESS_KEY_ID \
+        BMAS_STORAGE_SECRET_ACCESS_KEY \
+        BMAS_STORAGE_BUCKET \
+        BMAS_STORAGE_ENDPOINT_URL; do
+        if ! grep -q "^${key}=" "$ENV_FILE"; then
+            legacy="${key/BMAS_STORAGE_/BMAS_R2_}"
+            legacy_value="$(grep -m1 "^${legacy}=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+            printf '%s=%s\n' "$key" "$legacy_value" >> "$ENV_FILE"
+        fi
     done
 }
 
@@ -180,61 +182,107 @@ ensure_service_environment() {
     fi
 }
 
-migrate_legacy_r2_token() {
+migrate_legacy_config() {
     [[ -f "$INSTALLED_CONFIG" ]] || return 0
 
-    local has_token
-    has_token="$(awk '
+    local has_legacy
+    has_legacy="$(awk '
         /^[[:space:]]*\[/ {
             header=$0
             gsub(/^[[:space:]]*\[[[:space:]]*/, "", header)
             gsub(/[[:space:]]*\][[:space:]]*$/, "", header)
-            in_r2 = (header == "r2")
+            if (header == "r2" || header == "heartbeat" || header == "central") {
+                print "yes"
+                exit
+            }
+            if (header == "storage") in_storage = 1
             next
         }
-        in_r2 {
+        in_storage {
             line=$0
             sub(/^[[:space:]]*/, "", line)
-            if (line ~ /^token[[:space:]]*=/) {
+            if (line ~ /^min_free_gb[[:space:]]*=/) {
                 print "yes"
                 exit
             }
         }
     ' "$INSTALLED_CONFIG")"
 
-    [[ "$has_token" == "yes" ]] || return 0
+    [[ "$has_legacy" == "yes" ]] || return 0
 
-    local backup="$CONFIG_DIR/config.toml.legacy-token.bak"
+    local backup="$CONFIG_DIR/config.toml.legacy.bak"
     local tmp
     tmp="$(mktemp)"
 
     cp -p "$INSTALLED_CONFIG" "$backup"
 
     awk '
+        BEGIN {
+            in_storage_storage = 0
+            in_drop = 0
+            backend_seen = 0
+        }
         /^[[:space:]]*\[/ {
+            if (in_storage_storage && !backend_seen) print "backend = \"r2\""
+
             header=$0
             gsub(/^[[:space:]]*\[[[:space:]]*/, "", header)
             gsub(/[[:space:]]*\][[:space:]]*$/, "", header)
-            in_r2 = (header == "r2")
+
+            if (header == "r2") {
+                print "[storage]"
+                in_storage_storage = 1
+                backend_seen = 0
+                in_drop = 0
+                next
+            }
+            if (header == "heartbeat" || header == "central") {
+                in_storage_storage = 0
+                in_drop = 1
+                next
+            }
+            if (header == "storage") {
+                print "[limits]"
+                in_storage_storage = 0
+                in_drop = 0
+                next
+            }
+            in_storage_storage = 0
+            in_drop = 0
+            print
+            next
         }
-        in_r2 {
-            line=$0
-            sub(/^[[:space:]]*/, "", line)
-            if (line ~ /^token[[:space:]]*=/) next
+        {
+            if (in_drop) next
+            if (in_storage_storage) {
+                line=$0
+                sub(/^[[:space:]]*/, "", line)
+                if (line ~ /^token[[:space:]]*=/) next
+                if (line ~ /^backend[[:space:]]*=/) {
+                    backend_seen = 1
+                    gsub(/\$\{BMAS_R2_/, "${BMAS_STORAGE_")
+                    print
+                    next
+                }
+            }
+            gsub(/\$\{BMAS_R2_/, "${BMAS_STORAGE_")
+            print
         }
-        { print }
+        END {
+            if (in_storage_storage && !backend_seen) print "backend = \"r2\""
+        }
     ' "$INSTALLED_CONFIG" > "$tmp"
 
     install -o root -g bmas -m 0640 "$tmp" "$INSTALLED_CONFIG"
     rm -f "$tmp"
 
-    log "Removed legacy [r2] token from $INSTALLED_CONFIG"
+    log "Migrated legacy BMAS configuration to [storage]/[limits]."
     echo "Backup: $backup"
-    echo "Rotate the removed token if it was a live credential."
+    echo "Removed obsolete [heartbeat] and [central] sections and legacy R2 keys."
 
-    if [[ -z "$(config_value r2 secret_access_key "$INSTALLED_CONFIG")" ]]; then
-        echo "WARNING: [r2].secret_access_key is missing."
-        echo "Set BMAS_R2_SECRET_ACCESS_KEY in $ENV_FILE before enabling R2."
+    if [[ -z "$(config_value storage secret_access_key "$INSTALLED_CONFIG")" ]]; then
+        echo "WARNING: [storage].secret_access_key is missing."
+        echo "Set BMAS_STORAGE_SECRET_ACCESS_KEY in $ENV_FILE before enabling storage."
     fi
 }
 
@@ -287,6 +335,7 @@ getent group bmas >/dev/null 2>&1 \
 TMP="$(mktemp -d)"
 
 log "Ensuring BMAS environment and systemd configuration..."
+migrate_legacy_config
 ensure_environment_file
 ensure_service_environment
 
@@ -362,7 +411,6 @@ if [[ "$SYNC_CONFIG" == true ]]; then
 else
 
     log "[3/5] Preserving installed BMAS configuration."
-    migrate_legacy_r2_token
     echo "Use --sync-config to replace $INSTALLED_CONFIG from the source tree."
 
 fi

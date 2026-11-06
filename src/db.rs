@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::Serialize;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -31,43 +31,6 @@ pub struct Stream {
     pub deleted_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct Chunk {
-    pub id: String,
-    pub stream_id: String,
-    pub started_at: String,
-    pub ended_at: Option<String>,
-    pub duration_seconds: Option<i64>,
-    pub status: String,
-    pub local_path: Option<String>,
-    pub r2_prefix: Option<String>,
-    pub audio_archived: i64,
-    pub index_archived: i64,
-    pub error: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub segment_path: Option<String>,
-    pub retry_count: i64,
-    pub next_retry_at: Option<String>,
-    pub lease_until: Option<String>,
-    pub claimed_by: Option<String>,
-    pub last_error: Option<String>,
-    pub index_uploaded: i64,
-    pub audio_uploaded: i64,
-}
-
-#[derive(Debug, Clone, Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct Callback {
-    pub id: String,
-    pub kind: String,
-    pub payload: String,
-    pub attempts: i64,
-    pub next_attempt_at: String,
-    pub last_error: Option<String>,
-    pub created_at: String,
-    pub delivered_at: Option<String>,
-}
-
 pub struct NewStream<'a> {
     pub name: &'a str,
     pub url: Option<&'a str>,
@@ -93,17 +56,6 @@ pub struct StreamUpdate<'a> {
     pub input: Option<Option<&'a str>>,
     pub chunk_seconds: Option<i64>,
     pub archive_audio: Option<bool>,
-}
-
-pub struct ChunkCompletion<'a> {
-    pub ended_at: &'a str,
-    pub duration: i64,
-    pub r2_prefix: Option<&'a str>,
-    pub status: &'a str,
-    pub index_archived: bool,
-    pub audio_archived: bool,
-    pub index_uploaded: bool,
-    pub audio_uploaded: bool,
 }
 
 impl Database {
@@ -153,6 +105,14 @@ impl Database {
         .bind(external_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    pub async fn resolve_stream(&self, id_or_external_id: &str) -> Result<Option<Stream>> {
+        if let Some(stream) = self.get_stream(id_or_external_id).await? {
+            return Ok(Some(stream));
+        }
+
+        self.get_stream_by_external_id(id_or_external_id).await
     }
 
     pub async fn create_stream(&self, stream: NewStream<'_>) -> Result<Stream> {
@@ -297,192 +257,6 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn create_chunk(
-        &self,
-        id: &str,
-        stream_id: &str,
-        started_at: &str,
-        local_path: &str,
-        segment_path: &str,
-    ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            "INSERT INTO chunks
-            (id, stream_id, started_at, status, local_path, segment_path,
-             created_at, updated_at)
-             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(stream_id)
-        .bind(started_at)
-        .bind(local_path)
-        .bind(segment_path)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn claim_chunk(&self, worker_id: &str, lease_seconds: i64) -> Result<Option<Chunk>> {
-        let now = Utc::now();
-        let now_string = now.to_rfc3339();
-        let lease_until = (now + Duration::seconds(lease_seconds)).to_rfc3339();
-
-        Ok(sqlx::query_as::<_, Chunk>(
-            "UPDATE chunks SET
-                status = 'indexing',
-                claimed_by = ?,
-                lease_until = ?,
-                updated_at = ?
-             WHERE id = (
-                SELECT id FROM chunks
-                WHERE status IN ('pending', 'retrying', 'indexing', 'uploading')
-                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                  AND (lease_until IS NULL OR lease_until <= ?)
-                ORDER BY started_at
-                LIMIT 1
-             )
-             RETURNING *",
-        )
-        .bind(worker_id)
-        .bind(&lease_until)
-        .bind(&now_string)
-        .bind(&now_string)
-        .bind(&now_string)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    pub async fn update_chunk_status(
-        &self,
-        id: &str,
-        status: &str,
-        error: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE chunks SET status = ?, error = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(status)
-        .bind(error)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn complete_chunk(&self, id: &str, completion: ChunkCompletion<'_>) -> Result<()> {
-        sqlx::query(
-            "UPDATE chunks SET
-                status = ?,
-                ended_at = ?,
-                duration_seconds = ?,
-                r2_prefix = ?,
-                audio_archived = ?,
-                index_archived = ?,
-                index_uploaded = ?,
-                audio_uploaded = ?,
-                error = NULL,
-                last_error = NULL,
-                lease_until = NULL,
-                claimed_by = NULL,
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(completion.status)
-        .bind(completion.ended_at)
-        .bind(completion.duration)
-        .bind(completion.r2_prefix)
-        .bind(i64::from(completion.audio_archived))
-        .bind(i64::from(completion.index_archived))
-        .bind(i64::from(completion.index_uploaded))
-        .bind(i64::from(completion.audio_uploaded))
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn schedule_chunk_retry(
-        &self,
-        id: &str,
-        error: &str,
-        next_retry_at: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE chunks SET
-                status = 'retrying',
-                retry_count = retry_count + 1,
-                next_retry_at = ?,
-                last_error = ?,
-                lease_until = NULL,
-                claimed_by = NULL,
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(next_retry_at)
-        .bind(error)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn mark_chunk_failed(&self, id: &str, error: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE chunks SET
-                status = 'failed',
-                last_error = ?,
-                error = ?,
-                lease_until = NULL,
-                claimed_by = NULL,
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(error)
-        .bind(error)
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn recover_interrupted_chunks(&self) -> Result<u64> {
-        let now = Utc::now().to_rfc3339();
-
-        let result = sqlx::query(
-            "UPDATE chunks SET
-                status = CASE
-                    WHEN segment_path IS NULL THEN 'failed'
-                    ELSE 'retrying'
-                END,
-                next_retry_at = ?,
-                lease_until = NULL,
-                claimed_by = NULL,
-                last_error = COALESCE(last_error, 'recovered after restart'),
-                error = COALESCE(error, 'recovered after restart'),
-                updated_at = ?
-             WHERE status IN ('recording', 'indexing', 'uploading')",
-        )
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected())
-    }
-
     pub async fn active_stream_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT COUNT(*) FROM streams WHERE enabled = 1 AND deleted_at IS NULL",
@@ -491,100 +265,12 @@ impl Database {
         .await?)
     }
 
-    pub async fn failed_chunks(&self) -> Result<Vec<Chunk>> {
-        Ok(sqlx::query_as::<_, Chunk>(
-            "SELECT * FROM chunks
-                 WHERE status = 'failed'
-                 ORDER BY updated_at DESC",
+    pub async fn total_stream_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM streams WHERE deleted_at IS NULL",
         )
-        .fetch_all(&self.pool)
+        .fetch_one(&self.pool)
         .await?)
-    }
-
-    pub async fn list_chunks(
-        &self,
-        status: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<Chunk>> {
-        match status {
-            Some(status) => Ok(sqlx::query_as::<_, Chunk>(
-                "SELECT * FROM chunks WHERE status = ?
-                 ORDER BY started_at DESC LIMIT ? OFFSET ?",
-            )
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?),
-            None => Ok(sqlx::query_as::<_, Chunk>(
-                "SELECT * FROM chunks ORDER BY started_at DESC LIMIT ? OFFSET ?",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?),
-        }
-    }
-
-    pub async fn enqueue_callback(&self, kind: &str, payload: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO callbacks (id, kind, payload, attempts, next_attempt_at, created_at)
-             VALUES (?, ?, ?, 0, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(kind)
-        .bind(payload)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn pending_callback(&self) -> Result<Option<Callback>> {
-        let now = Utc::now().to_rfc3339();
-        Ok(sqlx::query_as::<_, Callback>(
-            "SELECT * FROM callbacks
-             WHERE delivered_at IS NULL AND next_attempt_at <= ?
-             ORDER BY next_attempt_at LIMIT 1",
-        )
-        .bind(&now)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    pub async fn reschedule_callback(
-        &self,
-        id: &str,
-        attempts: i64,
-        next_attempt_at: &str,
-        error: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE callbacks SET attempts = ?, next_attempt_at = ?, last_error = ?
-             WHERE id = ?",
-        )
-        .bind(attempts)
-        .bind(next_attempt_at)
-        .bind(error)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn mark_callback_delivered(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE callbacks SET delivered_at = ?, last_error = NULL WHERE id = ?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
     }
 }
 
@@ -617,19 +303,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn soft_delete_retains_chunk_history() {
+    async fn ephemeral_database_only_has_streams() {
+        let db = test_db().await;
+
+        for table in ["chunks", "callbacks"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 0, "table {} should not exist", table);
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_delete_retains_history_but_hides_stream() {
         let db = test_db().await;
         let stream = test_stream(&db).await;
-
-        db.create_chunk(
-            "chunk-1",
-            &stream.id,
-            "2026-11-03T09:00:00+00:00",
-            "/tmp/archive",
-            "/tmp/segment.wav",
-        )
-        .await
-        .unwrap();
 
         assert!(db.delete_stream(&stream.id).await.unwrap());
         assert!(db.get_stream(&stream.id).await.unwrap().is_none());
@@ -638,7 +330,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert_eq!(db.list_chunks(None, 10, 0).await.unwrap().len(), 1);
+        assert_eq!(db.total_stream_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -708,60 +400,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_claims_are_leased_and_recoverable() {
+    async fn resolves_stream_by_id_or_external_id() {
         let db = test_db().await;
         let stream = test_stream(&db).await;
 
-        db.create_chunk(
-            "chunk-1",
-            &stream.id,
-            "2026-11-03T09:00:00+00:00",
-            "/tmp/archive",
-            "/tmp/segment.wav",
-        )
-        .await
-        .unwrap();
-
-        let claimed = db.claim_chunk("worker-1", 60).await.unwrap().unwrap();
-        assert_eq!(claimed.id, "chunk-1");
-        assert_eq!(claimed.status, "indexing");
-
-        assert!(db.claim_chunk("worker-2", 60).await.unwrap().is_none());
-
-        db.schedule_chunk_retry(
-            "chunk-1",
-            "transient",
-            &(Utc::now() - Duration::seconds(1)).to_rfc3339(),
-        )
-        .await
-        .unwrap();
-
-        let retried = db.claim_chunk("worker-2", 60).await.unwrap().unwrap();
-        assert_eq!(retried.retry_count, 1);
-        assert_eq!(retried.status, "indexing");
-
-        db.mark_chunk_failed("chunk-1", "permanent").await.unwrap();
-        assert_eq!(db.failed_chunks().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn interrupted_chunks_are_requeued() {
-        let db = test_db().await;
-        let stream = test_stream(&db).await;
-
-        db.create_chunk(
-            "chunk-1",
-            &stream.id,
-            "2026-11-03T09:00:00+00:00",
-            "/tmp/archive",
-            "/tmp/segment.wav",
-        )
-        .await
-        .unwrap();
-        db.claim_chunk("worker-1", 60).await.unwrap().unwrap();
-
-        assert_eq!(db.recover_interrupted_chunks().await.unwrap(), 1);
-        let recovered = db.claim_chunk("worker-2", 60).await.unwrap().unwrap();
-        assert_eq!(recovered.status, "indexing");
+        assert_eq!(
+            db.resolve_stream(&stream.id).await.unwrap().unwrap().id,
+            stream.id
+        );
+        assert_eq!(
+            db.resolve_stream("external-test")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            stream.id
+        );
     }
 }
